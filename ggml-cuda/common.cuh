@@ -248,6 +248,58 @@ static __device__ void no_device_code(
     GGML_UNUSED(no_device_code); // suppress unused function warning
 }
 
+#if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
+#define AMD_SWIZZLE_MASK(and_mask, or_mask, xor_mask) ((and_mask) | ((or_mask)<<5) | ((xor_mask)<<10)) // 5-bit masks applied sequentially to the thread id
+#define AMD_DPP_ROW_RR(x) (0x120+(x)) // 121-12F - row rotate right by 1-15 threads - a row is 16 threads
+#define hip_move_dppf(src, dpp_ctrl, row_mask, bank_mask, bound_ctrl) \
+  hip_move_dppf_N<(dpp_ctrl), (row_mask), (bank_mask), (bound_ctrl)>((src))
+
+template <int dpp_ctrl, int row_mask, int bank_mask, bool bound_ctrl>
+static __device__ __forceinline__ float hip_move_dppf_N(float x) {
+    typedef union float_b32 {
+        float val;
+        int   b32;
+    } float_b32_t;
+    float_b32_t tmp;
+    tmp.val = x;
+    tmp.b32 = __builtin_amdgcn_mov_dpp(tmp.b32, dpp_ctrl, row_mask, bank_mask, bound_ctrl);
+    return tmp.val;
+}
+
+static __device__ __forceinline__ float warp_reduce_sum_impl_amd(float x) {
+    x += __hip_ds_swizzlef(x, AMD_SWIZZLE_MASK(0x1F, 0, 0x10)); // swap neighbouring groups of 16 lanes
+    x += hip_move_dppf(x, AMD_DPP_ROW_RR(8), 0xF, 0xF, true);
+    x += hip_move_dppf(x, AMD_DPP_ROW_RR(4), 0xF, 0xF, true);
+    x += hip_move_dppf(x, AMD_DPP_ROW_RR(2), 0xF, 0xF, true);
+    x += hip_move_dppf(x, AMD_DPP_ROW_RR(1), 0xF, 0xF, true);
+    return x;
+}
+
+static __device__ __forceinline__ float2 warp_reduce_sum_impl_amd(float2 a) {
+    a.x += __hip_ds_swizzlef(a.x, AMD_SWIZZLE_MASK(0x1F, 0, 0x10));
+    a.y += __hip_ds_swizzlef(a.y, AMD_SWIZZLE_MASK(0x1F, 0, 0x10));
+    a.x += hip_move_dppf(a.x, AMD_DPP_ROW_RR(8), 0xF, 0xF, true);
+    a.y += hip_move_dppf(a.y, AMD_DPP_ROW_RR(8), 0xF, 0xF, true);
+    a.x += hip_move_dppf(a.x, AMD_DPP_ROW_RR(4), 0xF, 0xF, true);
+    a.y += hip_move_dppf(a.y, AMD_DPP_ROW_RR(4), 0xF, 0xF, true);
+    a.x += hip_move_dppf(a.x, AMD_DPP_ROW_RR(2), 0xF, 0xF, true);
+    a.y += hip_move_dppf(a.y, AMD_DPP_ROW_RR(2), 0xF, 0xF, true);
+    a.x += hip_move_dppf(a.x, AMD_DPP_ROW_RR(1), 0xF, 0xF, true);
+    a.y += hip_move_dppf(a.y, AMD_DPP_ROW_RR(1), 0xF, 0xF, true);
+    return a;
+}
+
+static __device__ __forceinline__ float warp_reduce_max_impl_amd(float x) {
+    x = fmaxf(x, __hip_ds_swizzlef(x, AMD_SWIZZLE_MASK(0x1F, 0, 0x10)));
+    x = fmaxf(x, hip_move_dppf(x, AMD_DPP_ROW_RR(8), 0xF, 0xF, false));
+    x = fmaxf(x, hip_move_dppf(x, AMD_DPP_ROW_RR(4), 0xF, 0xF, false));
+    x = fmaxf(x, hip_move_dppf(x, AMD_DPP_ROW_RR(2), 0xF, 0xF, false));
+    x = fmaxf(x, hip_move_dppf(x, AMD_DPP_ROW_RR(1), 0xF, 0xF, false));
+    return x;
+}
+
+#endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
+
 #ifdef __CUDA_ARCH__
 #define NO_DEVICE_CODE no_device_code(__FILE__, __LINE__, __FUNCTION__, __CUDA_ARCH__, STRINGIZE(__CUDA_ARCH_LIST__))
 #else
@@ -255,20 +307,28 @@ static __device__ void no_device_code(
 #endif // __CUDA_ARCH__
 
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
+#if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
+    return warp_reduce_sum_impl_amd(x);
+#else
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
         x += __shfl_xor_sync(0xffffffff, x, mask, 32);
     }
     return x;
+#endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
 }
 
 static __device__ __forceinline__ float2 warp_reduce_sum(float2 a) {
+#if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
+    return warp_reduce_sum_impl_amd(a);
+#else
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
         a.x += __shfl_xor_sync(0xffffffff, a.x, mask, 32);
         a.y += __shfl_xor_sync(0xffffffff, a.y, mask, 32);
     }
     return a;
+#endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
 }
 
 #ifdef GGML_CUDA_F16
@@ -287,11 +347,15 @@ static __device__ __forceinline__ half2 warp_reduce_sum(half2 a) {
 #endif // GGML_CUDA_F16
 
 static __device__ __forceinline__ float warp_reduce_max(float x) {
+#if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
+    return warp_reduce_max_impl_amd(x);
+#else
 #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
         x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, mask, 32));
     }
     return x;
+#endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
 }
 
 //static __device__ __forceinline__ half2 warp_reduce_max(half2 x) {
